@@ -340,7 +340,7 @@ class AntiTruncationStreamProcessor:
                 # 处理流式响应
                 found_synthetic = False
                 has_real_tool_calls = False
-                side_buffer = io.StringIO()  # 暂存普通文本（防拼接）
+                emitted_text = False    # 是否已透传过正文或工具调用（纯思考不算产出）
 
                 async for line in response.body_iterator:
                     if not line:
@@ -391,7 +391,6 @@ class AntiTruncationStreamProcessor:
                                     "Anti-truncation: Stream complete with synthetic tool call"
                                 )
                                 yield line
-                                side_buffer.close()
                                 self._clear_content()
                                 return
                             else:
@@ -415,14 +414,11 @@ class AntiTruncationStreamProcessor:
 
                         if chunk_has_synthetic:
                             found_synthetic = True
-                            # 防拼接：丢弃之前暂存的普通文本
-                            if side_buffer.getvalue():
+                            if emitted_text:
                                 log.warning(
-                                    "Anti-truncation: Discarding side-buffered text "
-                                    "(content conflict with synthetic tool)"
+                                    "Anti-truncation: Plain text was streamed before "
+                                    "synthetic tool call (possible duplication)"
                                 )
-                                side_buffer.close()
-                                side_buffer = io.StringIO()
 
                             # 收集内容用于续传
                             self._append_content(synthetic_content)
@@ -437,34 +433,33 @@ class AntiTruncationStreamProcessor:
                             yield f"data: {json_str}\n\n".encode("utf-8")
 
                         elif real_calls:
-                            # 真实工具调用，原样透传
+                            # 真实工具调用（agent 场景），原样透传
                             has_real_tool_calls = True
+                            emitted_text = True
                             yield line
 
                         else:
-                            # 普通文本 chunk
                             if found_synthetic:
-                                # 已有合成工具调用，丢弃普通文本（防拼接）
-                                log.debug(
-                                    "Anti-truncation: Dropping plain text after synthetic tool call"
-                                )
+                                # 已有合成工具调用：丢弃后续正文/思考（防拼接），
+                                # 但放行 finishReason/usageMetadata 等元数据块
+                                if self._chunk_has_plain_text(data):
+                                    log.debug(
+                                        "Anti-truncation: Dropping plain text after synthetic tool call"
+                                    )
+                                    continue
+                                yield line
                                 continue
-                            else:
-                                # 暂存到 side buffer，等待看是否有合成工具调用
-                                text = self._extract_text_from_chunk(data)
-                                if text:
-                                    side_buffer.write(text)
-                                # 暂时不透传，等流结束时决定
-                                continue
+                            # 正文/思考 chunk 实时透传，恢复流式体验：
+                            # 思考分块（thought=true）由路由层转成 reasoning_content
+                            if self._chunk_has_plain_text(data):
+                                emitted_text = True
+                            yield line
 
                     else:
                         # 非 data: 开头的行，直接传递
                         yield line
 
                 # 流结束（break 或正常结束）
-                side_text = side_buffer.getvalue()
-                side_buffer.close()
-
                 if found_synthetic:
                     # 成功收到合成工具调用
                     log.info("Anti-truncation: Found synthetic tool call, output complete")
@@ -472,26 +467,30 @@ class AntiTruncationStreamProcessor:
                     yield b"data: [DONE]\n\n"
                     return
 
-                # 未收到合成工具调用
-                if side_text:
-                    # 有普通文本作为 fallback，输出它
+                # 真实工具调用（agent 场景）本身就是完整的助手回合，不能续传：
+                # 续传会重发同样的请求，导致同一工具调用被重复下发多次
+                if has_real_tool_calls:
                     log.info(
-                        f"Anti-truncation: No synthetic tool call, "
-                        f"using side-buffered text as fallback (length: {len(side_text)})"
+                        "Anti-truncation: Real tool calls present, treating turn as complete"
                     )
-                    self._append_content(side_text)
-                    # 构建一个包含 side buffer 文本的 chunk 输出
-                    fallback_chunk = self._build_fallback_text_chunk(side_text)
-                    if fallback_chunk:
-                        yield fallback_chunk
+                    self._clear_content()
+                    yield b"data: [DONE]\n\n"
+                    return
 
-                # 触发续传
-                if self.current_attempt < self.max_attempts:
-                    accumulated_text = self._get_collected_text()
-                    total_length = len(accumulated_text)
+                # 正文已经实时透传给客户端，说明模型本轮已给出产出，
+                # 视为完整回合，不再续传（续传只会拉长静默并可能重复输出）
+                if emitted_text:
                     log.info(
-                        f"Anti-truncation: No synthetic tool call in output "
-                        f"(length: {total_length}), preparing continuation "
+                        "Anti-truncation: Content already streamed, treating turn as complete"
+                    )
+                    self._clear_content()
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                # 整个流没有任何正文/工具产出（如上游只回思考就结束）→ 触发续传
+                if self.current_attempt < self.max_attempts:
+                    log.info(
+                        f"Anti-truncation: No usable output, preparing continuation "
                         f"(attempt {self.current_attempt + 1})"
                     )
                     continue
@@ -537,8 +536,9 @@ class AntiTruncationStreamProcessor:
         if accumulated_text:
             new_contents.append({"role": "model", "parts": [{"text": accumulated_text}]})
 
-        # 预填充模式：直接用拼接内容作为末尾 model 预填充
-        if self.enable_prefill_mode:
+        # 预填充模式：只有确有已输出内容可续写时才有意义；
+        # 没有任何产出时退回提示词续传，明确要求模型给出回答
+        if self.enable_prefill_mode and accumulated_text:
             log.debug("Anti-truncation: Using prefill continuation mode")
             request_data["contents"] = new_contents
             continuation_payload["request"] = request_data
@@ -594,6 +594,21 @@ class AntiTruncationStreamProcessor:
         json_str = json.dumps(chunk, separators=(",", ":"), ensure_ascii=False)
         return f"data: {json_str}\n\n".encode("utf-8")
 
+    @staticmethod
+    def _chunk_has_plain_text(data: Dict[str, Any]) -> bool:
+        """判断 chunk 中是否包含非思考的正文文本（思考分块与空文本 part 都不算）"""
+        if "response" in data:
+            data = data["response"]
+        for candidate in data.get("candidates", []):
+            for part in candidate.get("content", {}).get("parts", []):
+                if (
+                    isinstance(part, dict)
+                    and part.get("text")
+                    and not part.get("thought", False)
+                ):
+                    return True
+        return False
+
     async def _handle_non_streaming_response(self, response) -> bytes:
         """处理非流式响应"""
         while True:
@@ -648,6 +663,21 @@ class AntiTruncationStreamProcessor:
                 synthetic_content, real_calls, found_synthetic = (
                     extract_synthetic_content_from_response(response_data)
                 )
+
+                # 有真实工具调用或正文产出（agent 场景/完整回答）即为完整回合，
+                # 直接返回，不做无意义续传；纯思考回复才续传重试
+                inner = response_data.get("response", response_data)
+                real_text = ""
+                for candidate in inner.get("candidates", []):
+                    for part in candidate.get("content", {}).get("parts", []):
+                        if (
+                            isinstance(part, dict)
+                            and "text" in part
+                            and not part.get("thought", False)
+                        ):
+                            real_text += part["text"]
+                if (real_calls or real_text) and not found_synthetic:
+                    return content.encode() if isinstance(content, str) else content
 
                 if found_synthetic or self.current_attempt >= self.max_attempts:
                     if found_synthetic:
